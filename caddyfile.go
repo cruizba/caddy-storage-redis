@@ -326,6 +326,14 @@ func normalizeKeyPrefix(prefix string) (string, error) {
 }
 
 func (rs *RedisStorage) Cleanup() error {
+	// Release this config's reference to the shared client; it is only
+	// closed once no other config (e.g. the one replacing this on a reload)
+	// still uses it.
+	if rs.clientKey != "" {
+		_, err := sharedClients.Delete(rs.clientKey)
+		return err
+	}
+
 	// Close the Redis connection
 	if rs.client != nil {
 		rs.client.Close()

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/bsm/redislock"
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/certmagic"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -130,10 +131,26 @@ type RedisStorage struct {
 	// RouteRandomly Route commands randomly, only used in Cluster mode. Default: false
 	RouteRandomly bool `json:"route_randomly"`
 
+	client    redis.UniversalClient
+	clientKey string
+	locker    *redislock.Client
+	logger    *zap.SugaredLogger
+	locks     *sync.Map
+}
+
+// sharedClients pools Redis clients across config reloads, keyed by the
+// serialized storage configuration. Caddy provisions the new config before
+// cleaning up the old one, so on a reload with an unchanged storage config
+// the client is reused (refcount 1->2->1) instead of being closed and
+// recreated on every apply.
+var sharedClients = caddy.NewUsagePool()
+
+type clientDestructor struct {
 	client redis.UniversalClient
-	locker *redislock.Client
-	logger *zap.SugaredLogger
-	locks  *sync.Map
+}
+
+func (cd clientDestructor) Destruct() error {
+	return cd.client.Close()
 }
 
 // CompressionMode specifies the compression algorithm used when storing values.
@@ -294,49 +311,70 @@ func (rs *RedisStorage) initRedisClient(ctx context.Context) error {
 		return fmt.Errorf("'master_name' is required when using 'failover' client type")
 	}
 
-	if rs.ClientType == "failover" {
+	newClient := func() (redis.UniversalClient, error) {
+		if rs.ClientType == "failover" {
 
-		if rs.SentinelPassword != "" {
-			clientOpts.SentinelPassword = rs.SentinelPassword
+			if rs.SentinelPassword != "" {
+				clientOpts.SentinelPassword = rs.SentinelPassword
+			}
+
+			// Create new Redis Failover Cluster client
+			clusterClient := redis.NewFailoverClusterClient(clientOpts.Failover())
+
+			// Test connection to the Redis cluster
+			err := clusterClient.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
+				return shard.Ping(ctx).Err()
+			})
+			if err != nil {
+				return nil, err
+			}
+			return clusterClient, nil
+
+		} else if rs.ClientType == "cluster" || len(clientOpts.Addrs) > 1 {
+
+			// Create new Redis Cluster client
+			clusterClient := redis.NewClusterClient(clientOpts.Cluster())
+
+			// Test connection to the Redis cluster
+			err := clusterClient.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
+				return shard.Ping(ctx).Err()
+			})
+			if err != nil {
+				return nil, err
+			}
+			return clusterClient, nil
 		}
-
-		// Create new Redis Failover Cluster client
-		clusterClient := redis.NewFailoverClusterClient(clientOpts.Failover())
-
-		// Test connection to the Redis cluster
-		err := clusterClient.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
-			return shard.Ping(ctx).Err()
-		})
-		if err != nil {
-			return err
-		}
-		rs.client = clusterClient
-
-	} else if rs.ClientType == "cluster" || len(clientOpts.Addrs) > 1 {
-
-		// Create new Redis Cluster client
-		clusterClient := redis.NewClusterClient(clientOpts.Cluster())
-
-		// Test connection to the Redis cluster
-		err := clusterClient.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
-			return shard.Ping(ctx).Err()
-		})
-		if err != nil {
-			return err
-		}
-		rs.client = clusterClient
-
-	} else {
 
 		// Create new Redis simple standalone client
-		rs.client = redis.NewClient(clientOpts.Simple())
+		client := redis.NewClient(clientOpts.Simple())
 
 		// Test connection to the Redis server
-		err := rs.client.Ping(ctx).Err()
-		if err != nil {
-			return err
+		if err := client.Ping(ctx).Err(); err != nil {
+			return nil, err
 		}
+		return client, nil
 	}
+
+	// Share one client across config reloads. Closing a client per reload
+	// permanently leaks its sentinel watcher (go-redis FailoverClusterClient
+	// does not release it on Close), and reconnecting on every apply is
+	// wasteful in any case.
+	cfgKey, err := json.Marshal(rs)
+	if err != nil {
+		return err
+	}
+	rs.clientKey = string(cfgKey)
+	val, _, err := sharedClients.LoadOrNew(rs.clientKey, func() (caddy.Destructor, error) {
+		client, err := newClient()
+		if err != nil {
+			return nil, err
+		}
+		return clientDestructor{client}, nil
+	})
+	if err != nil {
+		return err
+	}
+	rs.client = val.(clientDestructor).client
 
 	// Create new redislock client
 	rs.locker = redislock.New(rs.client)

@@ -1,5 +1,7 @@
 # Redis Storage module for Caddy / Certmagic
 
+> **Note**: this is a fork of [pberkel/caddy-storage-redis](https://github.com/pberkel/caddy-storage-redis) (based on v1.8.0) that shares one Redis client across Caddy config reloads instead of closing and recreating it on every config apply. Closing a go-redis failover client leaks its sentinel watcher (a goroutine plus its connections to the sentinels), so deployments that reapply their config often accumulate goroutines and sentinel connections without bound. The client is pooled with `caddy.UsagePool` keyed by the storage configuration, so it is only really closed on shutdown or when the storage configuration changes. Module ID and configuration are unchanged (`module: redis`), making it a drop-in replacement.
+
 This is comprehensive rewrite of the [gamalan/caddy-tlsredis](https://github.com/gamalan/caddy-tlsredis) Redis storage plugin for Caddy.  Some highlights of this new version:
 
 * Fixes some logic issues with configuration parsing
